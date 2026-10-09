@@ -210,7 +210,10 @@ that assigns its own ggml block type to every tensor, such as ISTA-DASLab's [GSQ
 releases](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF). The text projections, token
 table, output head and, in an `-mtp` file, the MTP head keep their blocks: each is stored as the
 matching `gguf_*` format in the `gguf_blocks_v1` layout, so a row of the artifact is a row of the
-GGUF, byte for byte, and nothing is requantized. All eighteen `gguf_*` block types are supported:
+GGUF, byte for byte, and nothing is requantized. The one exception is the GDN controls
+(`ssm_alpha`, `ssm_beta`), which the Engine takes in BF16: an export that stores them as Q8_0
+blocks, as Underdog-Saluki's releases do, has their values rounded to BF16. All eighteen `gguf_*`
+block types are supported:
 Q8_0, Q2_0, Q4_0, Q5_0, Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL
 and IQ4_XS ([GGUF block formats](gguf.md)). The recipe undoes llama.cpp's Qwen3.5 exporter
 conventions the same way `bonsai2_27b_ternary` does, by row gathers and exact small-tensor

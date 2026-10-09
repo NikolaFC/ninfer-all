@@ -34,7 +34,7 @@ GGML_BLOCKS = {
 }
 
 
-def _q8_0_file(tmp_path, rows: int, columns: int, seed: int):
+def _q8_0_file(tmp_path, rows: int, columns: int, seed: int, name: str = "w"):
     generator = np.random.default_rng(seed)
     blocks = generator.integers(0, 256, size=(rows, columns // 32, 34), dtype=np.uint8)
     scales = generator.uniform(0.01, 0.02, size=(rows, columns // 32)).astype(np.float16)
@@ -43,9 +43,17 @@ def _q8_0_file(tmp_path, rows: int, columns: int, seed: int):
     write_gguf(
         path,
         {"general.architecture": "qwen35"},
-        [("w", (rows, columns), TYPE_Q8_0, blocks.tobytes())],
+        [(name, (rows, columns), TYPE_Q8_0, blocks.tobytes())],
     )
     return path, blocks
+
+
+def _q8_0_values(blocks: np.ndarray) -> np.ndarray:
+    """Independent ggml Q8_0 dequantization: binary16 d times each signed code byte."""
+
+    scales = blocks[..., :2].copy().view(np.float16).astype(np.float32)
+    codes = blocks[..., 2:].copy().view(np.int8).astype(np.float32)
+    return (codes * scales).reshape(blocks.shape[0], -1)
 
 
 def test_formats_are_ggml_blocks():
@@ -74,13 +82,10 @@ def test_rows_are_copied_byte_for_byte_through_the_row_map(tmp_path):
 
 
 def test_row_values_are_ggml_dequantization(tmp_path):
-    pytest.importorskip("gguf")
     path, blocks = _q8_0_file(tmp_path, 6, 64, 2)
     with GGUFFile(path) as gguf:
         source = gguf_blocks.block_source(gguf, "w", (6, 64), lambda b, e: np.arange(b, e))
-        scales = blocks[3:5, :, :2].copy().view(np.float16).astype(np.float32)
-        codes = blocks[3:5, :, 2:].view(np.int8).astype(np.float32)
-        assert torch.equal(source.rows(3, 5), torch.from_numpy((codes * scales).reshape(2, 64)))
+        assert torch.equal(source.rows(3, 5), torch.from_numpy(_q8_0_values(blocks[3:5])))
 
 
 def test_output_projection_columns_read_the_grouped_value_heads():
@@ -89,3 +94,17 @@ def test_output_projection_columns_read_the_grouped_value_heads():
     for tiled_head in (0, 1, 15, 16, 31, 47):
         key_head, repeat = tiled_head % 16, tiled_head // 16
         assert columns[tiled_head * 128 + 5] == (key_head * 3 + repeat) * 128 + 5
+
+
+def test_q8_0_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
+    # Underdog-Saluki-style exports store ssm_alpha/ssm_beta as Q8_0 blocks: their values reach the
+    # Engine's BF16 operand, the exporter's tiled value heads back in the grouped order.
+    heads = gguf_blocks.GDN_VALUE_HEADS
+    path, blocks = _q8_0_file(tmp_path, heads, 64, 5, "blk.0.ssm_alpha.weight")
+    with GGUFFile(path) as gguf:
+        values = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_alpha.weight").rows(0, heads)
+    tiled = _q8_0_values(blocks)
+    # Grouped head k * 3 + r is the exporter's tiled head r * 16 + k.
+    grouped = [r * 16 + k for k in range(16) for r in range(3)]
+    assert values.dtype == torch.bfloat16
+    assert torch.equal(values, torch.from_numpy(tiled[grouped]).to(torch.bfloat16))
