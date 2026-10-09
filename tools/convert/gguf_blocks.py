@@ -10,6 +10,10 @@ zero-centred norms drop their stored ``1 + w`` and ``ssm_a`` becomes ``A_log`` a
 move without re-quantising, so its Use carries an ``input_columns`` auxiliary: column ``c`` of the
 stored matrix multiplies element ``input_columns[c]`` of the grouped activation.
 
+The GDN controls ``ssm_alpha`` and ``ssm_beta`` are BF16 operands of the Engine. Exporters store
+them as BF16 words or as Q8_0 blocks (Underdog-Saluki and similar releases), whose values are
+rounded to BF16: the one place a stored value changes.
+
 Vision comes from the release's ``mmproj`` GGUF (``--source vision=mmproj.gguf``) with the official
 Vision formats, DFlash2 from ``--source dflash2`` and the frontend resources from ``--model``, which
 needs only the base checkpoint's config and tokenizer files.
@@ -55,6 +59,8 @@ from .ternary import (
 )
 
 MTP_BLOCK = LAYERS
+# The storage the GDN controls may have (gdn_control_source).
+GDN_CONTROL_TYPES = ("BF16", "Q8_0")
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen35",
@@ -94,8 +100,9 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
     }
 
 
-def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str]]:
-    """Row-major shape and kind ("blocks" = any stored ggml block type) of every tensor."""
+def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str | tuple[str, ...]]]:
+    """Row-major shape and kind of every tensor: "blocks" (any stored ggml block type) or the
+    ggml type names it may have."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
@@ -112,8 +119,8 @@ def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str]]:
             p + "attn_qkv.weight": ((GDN_CHANNELS, HIDDEN), "blocks"),
             p + "attn_gate.weight": ((GDN_VALUE_DIM, HIDDEN), "blocks"),
             p + "ssm_out.weight": ((HIDDEN, GDN_VALUE_DIM), "blocks"),
-            p + "ssm_alpha.weight": ((GDN_VALUE_HEADS, HIDDEN), "BF16"),
-            p + "ssm_beta.weight": ((GDN_VALUE_HEADS, HIDDEN), "BF16"),
+            p + "ssm_alpha.weight": ((GDN_VALUE_HEADS, HIDDEN), GDN_CONTROL_TYPES),
+            p + "ssm_beta.weight": ((GDN_VALUE_HEADS, HIDDEN), GDN_CONTROL_TYPES),
             p + "ssm_a": ((GDN_VALUE_HEADS,), "F32"),
             p + "ssm_dt.bias": ((GDN_VALUE_HEADS,), "F32"),
             p + "ssm_conv1d.weight": ((GDN_CHANNELS, GDN_TAPS), "F32"),
@@ -156,19 +163,11 @@ def validate(gguf: GGUFFile) -> None:
         )
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
-        stored = info.type_id in GGUF_FORMATS_BY_TYPE
-        if (
-            name.endswith(("ssm_alpha.weight", "ssm_beta.weight"))
-            and info.type_name == "Q8_0"
-        ):
-            # Saluki-style exports keep the small GDN controls in Q8_0 blocks instead of
-            # BF16. Accept as a third storage form; they are dequantised to BF16 on read.
-            if info.shape != shape:
-                raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
-            continue
-        if info.shape != shape or (kind == "blocks") != stored or (
-            kind != "blocks" and info.type_name != kind
-        ):
+        if kind == "blocks":
+            accepted = info.type_id in GGUF_FORMATS_BY_TYPE
+        else:
+            accepted = info.type_name in ((kind,) if isinstance(kind, str) else kind)
+        if info.shape != shape or not accepted:
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
     if gguf.data_bytes_available < end:
@@ -179,6 +178,7 @@ def block_format(gguf: GGUFFile, tensor: str) -> str:
     return GGUF_FORMATS_BY_TYPE[gguf.info(tensor).type_id].name
 
 
+GGML_Q8_0 = 8
 GGML_Q2_0 = 42
 
 
@@ -194,10 +194,24 @@ def dequantize_q2_0(blocks: np.ndarray) -> np.ndarray:
     return ((codes.astype(np.float32) - 1.0) * d).reshape(rows, -1)
 
 
+def dequantize_q8_0(blocks: np.ndarray) -> np.ndarray:
+    """ggml Q8_0 rows: 32 values per 34-byte block, a binary16 d then 32 signed code bytes q;
+    value j is d * q[j], exact in FP32."""
+
+    rows = blocks.shape[0]
+    b = np.ascontiguousarray(blocks).reshape(rows, -1, 34)
+    d = b[..., :2].copy().view("<f2").astype(np.float32)
+    q = b[..., 2:].copy().view(np.int8).astype(np.float32)
+    return (q * d).reshape(rows, -1)
+
+
 def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Tensor:
     blocks = gguf.read_blocks(tensor, first, last)
-    if gguf.info(tensor).type_id == GGML_Q2_0:
-        values = dequantize_q2_0(blocks)
+    local = {GGML_Q2_0: dequantize_q2_0, GGML_Q8_0: dequantize_q8_0}.get(
+        gguf.info(tensor).type_id
+    )
+    if local is not None:
+        values = local(blocks)
         return torch.from_numpy(np.ascontiguousarray(values)).reshape(last - first, -1)
     try:
         from gguf import GGMLQuantizationType
@@ -241,13 +255,10 @@ def block_source(
 
 
 def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
-    """One GDN A/B control as its BF16 operand, in the grouped value-head order.
+    """A GDN A/B control as its BF16 operand, its value heads in the grouped order: BF16 words
+    as stored, Q8_0 values rounded to BF16."""
 
-    The export may store the control as BF16 words (the ISTA/Swift convention) or as Q8_0
-    blocks (Saluki-style exports); both arrive at the same operand form.
-    """
-
-    if gguf.info(tensor).type_name == "Q8_0":
+    if gguf.info(tensor).type_id == GGML_Q8_0:
         values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
         return array_source(
             torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
