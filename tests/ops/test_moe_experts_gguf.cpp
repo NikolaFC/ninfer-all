@@ -248,6 +248,76 @@ int run_case(const Case& c, std::uint32_t seed) {
                       << (device_resident ? " matrix" : " vector") << ": a repeat differs\n";
             ++failures;
         }
+        if (ops::moe_experts_gguf_decode_supported(banks, tokens)) {
+            // The decode form must equal the separate kernels bit for bit, whole and split into a
+            // first stage and a second (the even and odd pairs) as missing experts are served.
+            const auto compare = [&](const char* what) {
+                check(cudaDeviceSynchronize(), what);
+                std::vector<float> other(got.size());
+                d_y.copy_to_host(other.data(), other.size() * 4);
+                if (std::memcmp(got.data(), other.data(), got.size() * 4) != 0) {
+                    std::cerr << "FAIL " << c.name << " T=" << tokens << ": " << what
+                              << " differs from the decode form\n";
+                    ++failures;
+                }
+            };
+            {
+                auto scope       = workspace.scope();
+                const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_ids, t_w, &t_s, banks, workspace, nullptr);
+                ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+            }
+            compare("the separate kernels");
+            std::vector<std::int32_t> first(ids.size()), second(ids.size());
+            for (std::size_t p = 0; p < ids.size(); ++p) {
+                const bool odd = ids[p] % 2 != 0;
+                first[p]       = odd ? -1 : ids[p];
+                second[p]      = odd ? ids[p] : -1;
+            }
+            DeviceBuffer d_first(ids.size() * 4), d_second(ids.size() * 4);
+            d_first.copy_from_host(first.data(), first.size() * 4);
+            d_second.copy_from_host(second.data(), second.size() * 4);
+            const Tensor t_first(d_first.p, DType::I32, {kTopK, tokens});
+            const Tensor t_second(d_second.p, DType::I32, {kTopK, tokens});
+            {
+                auto scope       = workspace.scope();
+                const auto state = ops::moe_experts_gguf_decode_begin(t_m, t_first, t_s, banks,
+                                                                      workspace, nullptr);
+                ops::moe_experts_gguf_decode_missing(state, t_m, t_second, banks, nullptr);
+                ops::moe_experts_gguf_decode_finish(state, t_first, &t_second, t_w, banks, &banks,
+                                                    nullptr, nullptr, nullptr, t_y, nullptr);
+            }
+            compare("the two-stage decode form");
+            {
+                // The shared expert on a side stream, joined before the sum is read.
+                ops::GgufMoeSide side;
+                check(cudaStreamCreateWithFlags(&side.stream, cudaStreamNonBlocking), "side stream");
+                check(cudaEventCreateWithFlags(&side.fork, cudaEventDisableTiming), "fork event");
+                check(cudaEventCreateWithFlags(&side.join, cudaEventDisableTiming), "join event");
+                {
+                    auto scope       = workspace.scope();
+                    const auto state = ops::moe_experts_gguf_decode_begin(
+                        t_m, t_first, t_s, banks, workspace, nullptr, &side);
+                    ops::moe_experts_gguf_decode_missing(state, t_m, t_second, banks, nullptr);
+                    ops::moe_experts_gguf_decode_finish(state, t_first, &t_second, t_w, banks,
+                                                        &banks, nullptr, nullptr, nullptr, t_y,
+                                                        nullptr);
+                }
+                compare("the decode form with a side stream");
+                check(cudaEventDestroy(side.fork), "fork event");
+                check(cudaEventDestroy(side.join), "join event");
+                check(cudaStreamDestroy(side.stream), "side stream");
+            }
+            {
+                auto scope       = workspace.scope();
+                const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_first, t_w, &t_s, banks, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_second, t_w, nullptr, banks, workspace,
+                                          nullptr);
+                ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+            }
+            compare("the two-stage separate kernels");
+        }
         double num = 0, den = 0, worst = 0, scale = 0;
         for (int t = 0; t < tokens; ++t) {
             std::vector<float> x(kHidden);

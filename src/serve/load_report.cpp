@@ -101,8 +101,10 @@ std::string make_stats_report(const LoadCapacity& capacity, const LoadSample& sa
                               "host_work", "context_cache"}) {
         report[block] = std::move(cumulative.at(block));
     }
-    if (auto rows = cumulative.find("ngram_table"); rows != cumulative.end()) {
-        report["ngram_table"] = std::move(*rows);
+    for (const char* block : {"ngram_table", "experts"}) {
+        if (auto found = cumulative.find(block); found != cumulative.end()) {
+            report[block] = std::move(*found);
+        }
     }
     Json entries = Json::array();
     for (std::uint32_t i = 0; i < stats.queue_entries; ++i) {

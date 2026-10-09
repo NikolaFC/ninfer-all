@@ -1229,6 +1229,20 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
             {"stalls", monotonic_delta(rows_then.stalls, rows_now.stalls)},
             {"stall_seconds", monotonic_delta(rows_then.stall_seconds, rows_now.stall_seconds)}};
     }
+    // Qwen3.8-Flash-Next's host- or disk-resident experts: the interval's routes, device-slot
+    // hits, CPU-computed pairs and bytes copied to the devices.
+    const ExpertResidencyStats& experts_now  = current.experts;
+    const ExpertResidencyStats& experts_then = previous.experts;
+    if (experts_now.routes != 0) {
+        record["experts"] = Json{
+            {"routes", monotonic_delta(experts_then.routes, experts_now.routes)},
+            {"hits", monotonic_delta(experts_then.hits, experts_now.hits)},
+            {"cpu_routes", monotonic_delta(experts_then.cpu_routes, experts_now.cpu_routes)},
+            {"admitted", monotonic_delta(experts_then.admitted, experts_now.admitted)},
+            {"transferred_bytes",
+             monotonic_delta(experts_then.transferred_bytes, experts_now.transferred_bytes)},
+            {"slots", experts_now.slots}};
+    }
     record["engine_recoveries"] =
         monotonic_delta(previous.engine_recoveries, current.engine_recoveries);
     return record.dump();

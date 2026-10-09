@@ -113,6 +113,47 @@ MoeLaunch moe_launcher(GgmlType type) {
     throw std::invalid_argument("gguf moe product: unsupported block type");
 }
 
+template <class Args>
+using DecodeLaunch = void (*)(const Args&, int, cudaStream_t);
+
+template <class Fn, template <ggml_type> class Pick>
+Fn decode_launcher(GgmlType type) {
+    switch (type) {
+    case GgmlType::Q8_0: return Pick<GGML_TYPE_Q8_0>::launch;
+    case GgmlType::Q4_0: return Pick<GGML_TYPE_Q4_0>::launch;
+    case GgmlType::Q5_0: return Pick<GGML_TYPE_Q5_0>::launch;
+    case GgmlType::Q2_0: return Pick<GGML_TYPE_Q2_0>::launch;
+    case GgmlType::Q2_K: return Pick<GGML_TYPE_Q2_K>::launch;
+    case GgmlType::Q3_K: return Pick<GGML_TYPE_Q3_K>::launch;
+    case GgmlType::Q4_K: return Pick<GGML_TYPE_Q4_K>::launch;
+    case GgmlType::Q5_K: return Pick<GGML_TYPE_Q5_K>::launch;
+    case GgmlType::Q6_K: return Pick<GGML_TYPE_Q6_K>::launch;
+    case GgmlType::IQ2_XXS: return Pick<GGML_TYPE_IQ2_XXS>::launch;
+    case GgmlType::IQ2_XS: return Pick<GGML_TYPE_IQ2_XS>::launch;
+    case GgmlType::IQ2_S: return Pick<GGML_TYPE_IQ2_S>::launch;
+    case GgmlType::IQ3_XXS: return Pick<GGML_TYPE_IQ3_XXS>::launch;
+    case GgmlType::IQ3_S: return Pick<GGML_TYPE_IQ3_S>::launch;
+    case GgmlType::IQ1_S: return Pick<GGML_TYPE_IQ1_S>::launch;
+    case GgmlType::IQ1_M: return Pick<GGML_TYPE_IQ1_M>::launch;
+    case GgmlType::IQ4_NL: return Pick<GGML_TYPE_IQ4_NL>::launch;
+    case GgmlType::IQ4_XS: return Pick<GGML_TYPE_IQ4_XS>::launch;
+    }
+    throw std::invalid_argument("gguf moe decode: unsupported block type");
+}
+
+template <ggml_type type>
+struct PickUp {
+    static constexpr auto launch = &moe_decode_up_launch<type>;
+};
+template <ggml_type type>
+struct PickDown {
+    static constexpr auto launch = &moe_decode_down_launch<type>;
+};
+template <ggml_type type>
+struct PickPrep {
+    static constexpr auto launch = &moe_decode_prep_launch<type>;
+};
+
 // One block: the pairs of each expert counted, scanned into bounds, then placed. The experts with
 // pairs are listed in ascending order.
 constexpr int kSortThreads = 1024;
@@ -603,6 +644,38 @@ void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
     args.out_bf16 = out;
     detail::moe_launcher(type)(args, max_active, chunk, true, stream);
 }
+
+void moe_decode_up(GgmlType type, const MoeDecodeUpArgs& args, int chunk, cudaStream_t stream) {
+    if (args.m == nullptr || args.gate == nullptr || args.up == nullptr || args.middle == nullptr) {
+        throw std::invalid_argument("gguf moe decode: invalid up arguments");
+    }
+    detail::decode_launcher<detail::DecodeLaunch<MoeDecodeUpArgs>, detail::PickUp>(type)(args, chunk,
+                                                                                      stream);
+}
+
+void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cudaStream_t stream) {
+    if (args.table_a == nullptr || args.middle == nullptr || args.weights == nullptr ||
+        args.fixed == nullptr || (args.y != nullptr && args.counter == nullptr) ||
+        (args.ids_b != nullptr && args.table_b == nullptr)) {
+        throw std::invalid_argument("gguf moe decode: invalid down arguments");
+    }
+    detail::decode_launcher<detail::DecodeLaunch<MoeDecodeDownArgs>, detail::PickDown>(type)(
+        args, chunk, stream);
+}
+
+void moe_decode_prep(GgmlType type, const MoeDecodePrepArgs& args, cudaStream_t stream) {
+    if (args.m == nullptr || args.ids == nullptr || args.ds == nullptr || args.qsum == nullptr) {
+        throw std::invalid_argument("gguf moe decode: invalid preparation arguments");
+    }
+    detail::decode_launcher<void (*)(const MoeDecodePrepArgs&, cudaStream_t), detail::PickPrep>(
+        type)(args, stream);
+}
+
+bool moe_decode_transposed(GgmlType type) {
+    // Decoder<type>::kTransposed of ggml_bridge_vec.cuh.
+    return type == GgmlType::Q2_0;
+}
+
 
 int matrix_activation_layout(GgmlType type) {
     return static_cast<int>(mmq_get_q8_1_ds_layout(detail::to_ggml(type)));

@@ -92,6 +92,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024)\n"
+           "  --decode-rounds-per-prefill N Qwen3.8-Flash-Next: decode rounds after each prefill\n"
+           "                                chunk while others generate (0: chunk / 64; 1 alternates)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
            "                                (default: the largest budget that still lets\n"
            "                                every lane be admitted at once, the remaining\n"
@@ -628,6 +630,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+            continue;
+        }
+        if (arg == "--decode-rounds-per-prefill") {
+            options.decode_rounds_per_prefill = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--decode-rounds-per-prefill"), "decode-rounds-per-prefill"));
+            if (options.decode_rounds_per_prefill > 4096) {
+                throw std::invalid_argument("--decode-rounds-per-prefill must be in [0,4096]");
+            }
             continue;
         }
         if (arg == "--fast-prefill-kernel") {

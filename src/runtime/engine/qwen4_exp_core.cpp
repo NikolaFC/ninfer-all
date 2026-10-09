@@ -42,6 +42,9 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// Device memory kept free when the host expert cache grows after warm-up.
+constexpr std::uint64_t kGrowthMargin = 640ULL << 20;
+
 std::uint64_t elapsed_ns(Clock::time_point from, Clock::time_point to) {
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
@@ -239,6 +242,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         // The first request would otherwise load every kernel it reaches.
         StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);
         instance->executor->warm_up();
+        // What startup left free beyond a margin for lazily loaded kernels and the CUDA Graphs
+        // the first requests capture becomes expert slots.
+        instance->executor->grow_expert_cache(kGrowthMargin);
         warm.complete();
     }
     instance->free_after_weights = free_after_weights;
@@ -425,7 +431,9 @@ struct Qwen4ExpCore::Impl {
     // Worker-owned.
     std::vector<Slot> slots; // by executor sequence
     std::uint64_t use_clock = 0;
-    bool prefill_turn       = true; // a prefill chunk and a decode step take turns
+    // Decode rounds still owed after a prefill chunk before the next chunk may run.
+    std::uint32_t decode_rounds_due = 0;
+    std::uint32_t decode_rounds_per_prefill = 1;
 
     // Head-device sampling planes, a row per slot; with structured output the grammars' token
     // bitmasks too. The host side is staged in pinned memory: configs, positions, sampled tokens.
@@ -477,7 +485,11 @@ struct Qwen4ExpCore::Impl {
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
           reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
-          slots(i.executor->options().sequences) {
+          slots(i.executor->options().sequences),
+          decode_rounds_per_prefill(options.decode_rounds_per_prefill != 0
+                                        ? options.decode_rounds_per_prefill
+                                        : std::max<std::uint32_t>(
+                                              1, i.executor->options().prefill_chunk / 64)) {
         RankBinding bind(device, i.executor->head_rank());
         const std::size_t rows = slots.size();
         // A sampling call's columns per row: one, or a verification's drafts and bonus.
@@ -659,6 +671,13 @@ struct Qwen4ExpCore::Impl {
     // Every request gauge, from the worker, which owns the slots and the executor.
     void publish_stats() {
         const NgramTableStats ngram = instance.executor->ngram_stats();
+        const auto cache            = instance.executor->expert_cache_stats();
+        const ExpertResidencyStats experts{.routes            = cache.routes,
+                                           .hits              = cache.hits,
+                                           .cpu_routes        = cache.cpu_routes,
+                                           .admitted          = cache.admitted,
+                                           .transferred_bytes = cache.copied_bytes,
+                                           .slots             = cache.slots};
         std::uint32_t running = 0, prefilling = 0, decoding = 0;
         for (const Slot& slot : slots) {
             if (!slot.request) { continue; }
@@ -672,6 +691,7 @@ struct Qwen4ExpCore::Impl {
         stats.prefilling_requests   = prefilling;
         stats.decode_ready_requests = decoding;
         stats.ngram_table           = ngram;
+        stats.experts               = experts;
     }
 
     // A request failed on its own: it completes with the error, and its sequence keeps nothing
@@ -1084,13 +1104,15 @@ struct Qwen4ExpCore::Impl {
                 prefilling = slot.request;
             }
         }
-        if (prefilling && (prefill_turn || !decoding)) {
-            prefill_turn = false;
+        if (prefilling && (decode_rounds_due == 0 || !decoding)) {
+            // A long prompt's chunk takes far longer than a decode round: the streams that are
+            // generating get several rounds after it rather than one.
+            decode_rounds_due = decode_rounds_per_prefill;
             try {
                 prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
         } else if (decoding) {
-            prefill_turn = true;
+            if (decode_rounds_due > 0) { --decode_rounds_due; }
             decode_step();
         }
     }
@@ -1317,7 +1339,10 @@ struct Qwen4ExpCore::Impl {
             r.vision_seconds = seconds(vision_start, Clock::now());
         }
         const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
-        const std::uint32_t n     = std::min(executor.options().prefill_chunk, until - r.prefilled);
+        // A media prompt goes chunk by chunk; a text prompt in spans where the executor has them.
+        const std::uint32_t step =
+            r.media ? executor.options().prefill_chunk : executor.prompt_step();
+        const std::uint32_t n = std::min(step, until - r.prefilled);
         const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         executor.forward(r.slot, chunk, 1);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());

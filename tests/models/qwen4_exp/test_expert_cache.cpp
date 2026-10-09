@@ -1,8 +1,9 @@
-// The expert cache must never change what a kernel reads: after any sequence of routes and
-// rebalances, every table entry points either at the expert's bytes in the pinned host block or at
-// a device slot holding the same bytes, a cached down matrix followed by zeros (the expert matrix
-// kernel reads past a down row's end). It must also admit the experts a layer routes to most, keep
-// within its slots, and leave a layer without slots untouched.
+// The expert cache must never change what a kernel reads: after any sequence of routes, rebalances,
+// admissions and growth, every table entry points either at the expert's bytes in the pinned host
+// block or at a device slot holding the same bytes, a cached down matrix followed by zeros (the
+// expert matrix kernel reads past a down row's end). It must also admit the experts a layer routes
+// to most, keep within its slots, give every layer the same number of slots, take the least
+// recently used slot not in use on an admission, and count a fresh admission's routes as misses.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_cache.h"
@@ -82,13 +83,14 @@ int run() {
         {.rank = 0, .stream = device.stream, .gate = g0.view(), .up = u0.view(), .down = d0.view()},
         {.rank = 0, .stream = device.stream, .gate = g1.view(), .up = u1.view(), .down = d1.view()},
     };
-    // An even split of 2 * 102,400 bytes: slots of 4096 + 4096 + 2304 bytes for layer 0 and
-    // 1536 + 3072 + 1280 for layer 1 (each down followed by its 256 zero bytes, aligned).
+    // 2 * 102,400 bytes over slots of 4096 + 4096 + 2304 bytes for layer 0 and 1536 + 3072 + 1280
+    // for layer 1 (each down followed by its 256 zero bytes, aligned): 16,384 bytes a slot pair,
+    // so twelve slots each.
     const std::vector<std::uint64_t> budget = {2 * 102400};
     ExpertCache cache(device, layers, budget);
     const auto slots = cache.stats().slots;
-    require(slots == 9 + 17,
-            "slots per layer follow each layer's expert size: " + std::to_string(slots));
+    require(slots == 12 + 12,
+            "every layer gets the same number of slots: " + std::to_string(slots));
 
     // Layer 0 routes heavily to experts 5 and 7; layer 1 spreads.
     std::vector<std::int32_t> hot;
@@ -107,11 +109,11 @@ int run() {
         const int cached0 = g0.verify("gate 0") + 0;
         require(u0.verify("up 0") == cached0 && d0.verify("down 0", 256) == cached0,
                 "a layer's three banks cache the same experts");
-        require(cached0 <= 9, "layer 0 keeps within its slots");
+        require(cached0 <= 12, "layer 0 keeps within its slots");
         const int cached1 = g1.verify("gate 1");
         require(u1.verify("up 1") == cached1 && d1.verify("down 1", 256) == cached1,
                 "layer 1's banks agree");
-        require(cached1 <= 17, "layer 1 keeps within its slots");
+        require(cached1 <= 12, "layer 1 keeps within its slots");
     }
     std::vector<const void*> entries(kExperts);
     g0.table.copy_to_host(entries.data(), entries.size() * sizeof(void*));
@@ -120,6 +122,88 @@ int run() {
     const auto stats = cache.stats();
     require(stats.routes == 6 * 240 && stats.hits > 0 && stats.admitted > 0,
             "the cache counts routes, hits and admissions");
+
+    // Layer 1 admits on its own from now on: an admission takes the least recently used slot
+    // whose expert the call does not use, and the caller copies the expert in and patches the
+    // tables, as the expert misses do.
+    cache.hand_over(1);
+    const auto admit = [&](std::int32_t expert, const std::vector<std::uint32_t>& last_use,
+                           const std::vector<unsigned char>& in_use) {
+        ExpertCache::Admitted out;
+        if (!cache.admit(1, expert, last_use, in_use, out)) { return out; }
+        const Bank* banks[3] = {&g1, &u1, &d1};
+        for (int k = 0; k < 3; ++k) {
+            require(cudaMemcpy(out.slot[k], banks[k]->pointers[expert], banks[k]->bytes,
+                               cudaMemcpyHostToDevice) == cudaSuccess,
+                    "copy an admitted expert");
+            auto* table = static_cast<const void**>(banks[k]->table.p);
+            require(cudaMemcpy(table + expert, &out.slot[k], sizeof(void*),
+                               cudaMemcpyHostToDevice) == cudaSuccess,
+                    "patch an admitted entry");
+            if (out.victim >= 0) {
+                require(cudaMemcpy(table + out.victim, &out.victim_host[k], sizeof(void*),
+                                   cudaMemcpyHostToDevice) == cudaSuccess,
+                        "patch a victim entry");
+            }
+        }
+        return out;
+    };
+    // Fill every free slot first, then evict by recency.
+    std::vector<std::uint32_t> last_use(kExperts, 0);
+    std::vector<std::int32_t> held;
+    for (int e = 0; e < kExperts; ++e) {
+        if (cache.cached(1, 0, e) != nullptr) { held.push_back(e); }
+    }
+    for (std::size_t i = 0; i < held.size(); ++i) { last_use[std::size_t(held[i])] = 100 + std::uint32_t(i); }
+    std::int32_t newcomer = 0;
+    while (cache.cached(1, 0, newcomer) != nullptr) { ++newcomer; }
+    std::vector<unsigned char> in_use(kExperts, 0);
+    in_use[std::size_t(newcomer)] = 1;
+    in_use[std::size_t(held.front())] = 1; // the oldest is in use: the next oldest goes
+    const auto admitted = admit(newcomer, last_use, in_use);
+    require(admitted.slot[0] != nullptr, "an admission into a full layer finds a slot");
+    if (held.size() == 12) {
+        require(admitted.victim == held[1],
+                "the least recently used expert the call does not use leaves");
+    }
+    require(cache.cached(1, 0, newcomer) == admitted.slot[0], "the newcomer is cached");
+    std::vector<std::int32_t> again(10, newcomer);
+    const auto before = cache.stats();
+    cache.observe(1, again, 1);
+    require(cache.stats().hits == before.hits, "a fresh admission's routes are misses");
+    cache.observe(1, again, 1);
+    require(cache.stats().hits == before.hits + 10, "afterwards they are hits");
+    device.synchronize();
+    require(g1.verify("gate 1 admitted") <= 12 && d1.verify("down 1 admitted", 256) <= 12,
+            "admitted slots hold their experts");
+
+    // Growth after startup: both layers gain the same number of free slots in a second block,
+    // which the next admissions and rebalances fill.
+    const auto ranges_before = cache.storage(0);
+    require(ranges_before[1].first == ranges_before[1].second, "no second block before growth");
+    const auto added = cache.grow(std::vector<std::uint64_t>{4 * 16384});
+    require(added.size() == 1 && added[0] == 4 * 16384 && cache.stats().slots == 24 + 8,
+            "growth gives each growing layer the same slots: " + std::to_string(cache.stats().slots));
+    const auto ranges_after = cache.storage(1);
+    require(ranges_after[1].second - ranges_after[1].first == 4 * 5888, "layer 1's second block");
+    std::int32_t next = 0;
+    while (cache.cached(1, 0, next) != nullptr) { ++next; }
+    std::fill(in_use.begin(), in_use.end(), 0);
+    const auto grown = admit(next, last_use, in_use);
+    const auto at    = reinterpret_cast<std::uintptr_t>(grown.slot[0]);
+    require(grown.victim < 0 && at >= ranges_after[1].first && at < ranges_after[1].second,
+            "a grown layer admits into a free slot of its second block");
+    for (int round = 0; round < 4; ++round) {
+        cache.observe(0, hot, 40);
+        cache.rebalance(1u << 20);
+    }
+    device.synchronize();
+    const int cached0 = g0.verify("gate 0 grown");
+    require(cached0 <= 16 && u0.verify("up 0 grown") == cached0 &&
+                d0.verify("down 0 grown", 256) == cached0,
+            "a grown rebalancing layer stays consistent");
+    require(g1.verify("gate 1 grown") <= 16 && d1.verify("down 1 grown", 256) <= 16,
+            "a grown handed-over layer stays consistent");
     return 0;
 }
 

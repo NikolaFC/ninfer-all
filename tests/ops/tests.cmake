@@ -142,6 +142,10 @@ ninfer_add_op_test(ninfer_e8_root_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_e8_root_decode.cu"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_fixed_point_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fixed_point.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
   LIBRARIES ninfer_ops)
@@ -297,4 +301,7 @@ foreach(table IN ITEMS legacy unified)
 endforeach()
 ninfer_add_test(ninfer_moe_expert_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_expert_cpu.cpp"
+  LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_gguf_expert_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu.cpp"
   LIBRARIES ninfer_ops)

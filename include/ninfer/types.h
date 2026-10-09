@@ -476,11 +476,15 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
-// Native Flash-Next host experts, concurrency one. By default all misses execute on the GPU.
-// Shares below one enable experimental CPU mixing with different numerical results.
+// Flash-Next host and disk experts: how a decode or verification call gets the routed experts the
+// device cache lacks. By default every miss executes on the GPU; a DMA share below one lets the CPU
+// compute the rest, with different numerical results (native banks need concurrency one).
 struct HybridExpertOptions {
     float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
     std::uint32_t cpu_threads = 0; // automatic, or 1..256
+    // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
+    // let the expert kernels read host experts across the bus (mapped; host experts only).
+    bool mapped_misses = false;
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
@@ -594,6 +598,9 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Qwen3.8-Flash-Next: decode rounds run after each prefill chunk while other requests generate;
+    // 0 is prefill_chunk / 64. One alternates strictly.
+    std::uint32_t decode_rounds_per_prefill = 0;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
     bool fast_prefill_kernel           = false;
@@ -1623,6 +1630,19 @@ struct NgramTableStats {
     double stall_seconds = 0.0;
 };
 
+// Qwen3.8-Flash-Next's routed experts with host or disk residency, monotonic. A route is one
+// (token, expert) pair a pass took; a hit found its expert in a device slot. transferred_bytes
+// counts the expert bytes copied to the devices (misses and cache admissions); cpu_routes the
+// pairs computed by the CPU.
+struct ExpertResidencyStats {
+    std::uint64_t routes            = 0;
+    std::uint64_t hits              = 0;
+    std::uint64_t cpu_routes        = 0;
+    std::uint64_t admitted          = 0;
+    std::uint64_t transferred_bytes = 0;
+    std::uint32_t slots             = 0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -1763,6 +1783,7 @@ struct RuntimeStats {
     // context cache instead of latching the Engine unavailable.
     std::uint64_t engine_recoveries = 0;
     NgramTableStats ngram_table;
+    ExpertResidencyStats experts;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
