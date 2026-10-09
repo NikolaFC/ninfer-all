@@ -538,7 +538,8 @@ most requests admitted at once since startup, and the Engine's counters since st
 the request log's `throughput` record (see [Structured request log](#structured-request-log)):
 `tokens`, `throughput_tokens_per_second` averaged over the uptime, `scheduler`, `decode_batch`,
 `host_work` and the `context_cache` counters and gauges, and for Qwen3.8-Flash-Next the
-`ngram_table` reads (the block appears after the first row read). `queue` holds `depth`, the number of
+`ngram_table` reads (the block appears after the first row read) and, with host or disk experts,
+the `experts` counters. `queue` holds `depth`, the number of
 requests waiting for admission, and `entries`: the first 16 of them in submission order, each with
 its Engine `request_id`, `position` and `wait_seconds`, refreshed at least once a second while
 requests wait. It needs the API key like `/v1/load` and, like it, reads only published snapshots.
@@ -1734,6 +1735,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--decode-rounds-per-prefill N` | Qwen3.8-Flash-Next: decode rounds that run after each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -2118,6 +2120,11 @@ With Qwen3.8-Flash-Next and its n-gram table, `ngram_table` reports the interval
 summed, `read_latency_us` the `p50` and `p99` of a pass's read as the upper bound of its
 power-of-two histogram bucket, and `stalls` and `stall_seconds` the passes whose PLE layer waited
 for its rows after the layers before it and the device time it waited.
+
+With host- or disk-resident Flash-Next experts, `experts` reports the interval's routed
+(token, expert) pairs as `routes`, those served from a device slot as `hits`, the pairs the CPU
+computed as `cpu_routes`, the experts copied into device slots as `admitted`, the expert bytes
+copied to the devices as `transferred_bytes`, and the current number of device `slots`.
 
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
