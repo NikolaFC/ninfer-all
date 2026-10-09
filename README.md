@@ -90,6 +90,10 @@ One request, greedy, October 2026. Each cell is **decode of a short answer · pr
 
 † Two RTX 3090 Ti.
 
+The host and disk rows predate the October 9 decode work on the RTX 3090 (host experts there now
+decode 87-94 tok/s in a different workload, 98-100 with a repeated prompt):
+[measurements](docs/qwen3-8-flash-next.md#october-9-decode-speed-on-one-rtx-3090).
+
 **IQ3_S** (51.9 GiB model + the same table):
 
 | Experts | RTX PRO 6000 | RTX 5090 | RTX 3090 |

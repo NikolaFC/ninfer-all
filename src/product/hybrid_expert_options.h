@@ -11,14 +11,17 @@
 namespace ninfer::product {
 
 inline constexpr const char* kHybridExpertHelp =
-    "  --expert-dma-share F          native host experts: GPU share of cache misses,\n"
-    "                                0..1 (default 1); below 1 enables experimental CPU mixing\n"
+    "  --expert-dma-share F          host or disk experts: GPU share of cache misses,\n"
+    "                                0..1 (default 1); below 1 lets the CPU compute the rest\n"
     "                                prefill always uses the GPU\n"
+    "  --expert-misses staged|mapped GGUF experts: copy misses into device staging while the\n"
+    "                                cached experts run (default), or read host experts across\n"
+    "                                the bus inside the expert kernels\n"
     "  --expert-cpu-threads N        CPU workers, 1..256 (default automatic)\n"
     "  --expert-cache-adaptive       replace cold cached experts between calls;\n"
     "                                changes the CPU/GPU arithmetic partition\n"
-    "  --expert-profile FILE         fill the cache from recorded expert counts\n"
-    "  --expert-profile-out FILE     record counts for this artifact after requests\n";
+    "  --expert-profile FILE         fill the host expert cache from recorded counts\n"
+    "  --expert-profile-out FILE     record expert counts for this artifact after requests\n";
 
 template<class Value>
 bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& out, Value&& value) {
@@ -39,6 +42,15 @@ bool parse_hybrid_expert_option(std::string_view option, HybridExpertOptions& ou
             throw std::invalid_argument("--expert-cpu-threads takes an integer in 1..256");
         }
         out.cpu_threads = threads;
+    } else if (option == "--expert-misses") {
+        const std::string_view mode(value());
+        if (mode == "staged") {
+            out.mapped_misses = false;
+        } else if (mode == "mapped") {
+            out.mapped_misses = true;
+        } else {
+            throw std::invalid_argument("--expert-misses takes staged or mapped");
+        }
     } else if (option == "--expert-cache-adaptive") {
         out.adaptive_cache = true;
     } else if (option == "--expert-profile" || option == "--expert-profile-out") {

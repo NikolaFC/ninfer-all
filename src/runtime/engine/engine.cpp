@@ -279,7 +279,7 @@ public:
             return;
         }
         if (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-            options.hybrid_experts.cpu_threads != 0 ||
+            options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.mapped_misses ||
             options.hybrid_experts.adaptive_cache || !options.hybrid_experts.routing_profile.empty() ||
             !options.hybrid_experts.record_profile.empty()) {
             throw std::invalid_argument("hybrid expert options require native Qwen3.8-Flash-Next host experts");

@@ -76,6 +76,85 @@ void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
                       Tensor& y, cudaStream_t stream);
 
 /**
+ * The same sum in stages, for banks whose missing experts arrive in device memory, or are computed
+ * elsewhere, while the resident ones run. begin quantizes m and zeroes the 2^-32 fixed-point sum in
+ * `workspace`; the caller keeps that workspace scope open until finish. Each add sums the routed
+ * pairs whose `ids` entry is non-negative (a negative entry is a pair another stage adds) through
+ * `banks`, and the shared expert when `shared` is given. add_products adds `*count` (at most
+ * `max_count`) externally computed pair values, FP32 [count][2560] with their pair indices in
+ * `pairs`, weighted by `weights` and rounded per pair as the kernels round theirs; its arrays may be
+ * mapped host memory. finish stores y. Pairs split across adds give exactly the single call's sum;
+ * external products carry their own arithmetic.
+ */
+struct GgufMoeStage {
+    std::int32_t tokens       = 0;
+    void* activation          = nullptr;
+    unsigned long long* fixed = nullptr;
+};
+
+[[nodiscard]] GgufMoeStage moe_experts_gguf_begin(const Tensor& m, WorkspaceArena& workspace,
+                                                  cudaStream_t stream);
+void moe_experts_gguf_add(const GgufMoeStage& stage, const Tensor& m, const Tensor& ids,
+                          const Tensor& weights, const Tensor* shared,
+                          const GgufMoeWeights& banks, WorkspaceArena& workspace,
+                          cudaStream_t stream);
+void moe_experts_gguf_add_products(const GgufMoeStage& stage, const float* values,
+                                   const std::int32_t* pairs, const std::int32_t* count,
+                                   std::int32_t max_count, const Tensor& weights,
+                                   cudaStream_t stream);
+void moe_experts_gguf_finish(const GgufMoeStage& stage, Tensor& y, cudaStream_t stream);
+
+// A second stream on which the decode form runs the shared expert concurrently with the routed
+// experts, and the events that fork it from the call's stream and join it back before the sum is
+// read. All three are the caller's, reused call after call.
+struct GgufMoeSide {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t fork    = nullptr;
+    cudaEvent_t join    = nullptr;
+};
+
+/**
+ * The decode form, up to eight tokens over banks whose gate and up share a block type: the same
+ * sum in a few launches instead of a sort, memsets, activation passes and a store per bank, with
+ * every row's arithmetic unchanged (moe_experts_gguf takes it whenever it applies). begin runs the
+ * pairs whose `ids` entry is non-negative and the shared expert; decode_missing adds the up rows of
+ * the pairs `ids` of a second stage lists, through `banks` (missing experts staged elsewhere);
+ * finish runs every down row from the two id sets and their banks, adds external products and
+ * stores y. The workspace scope stays open from begin to finish. Given a side stream, begin runs
+ * the shared expert there and finish waits for it.
+ */
+struct GgufMoeDecode {
+    std::int32_t tokens       = 0;
+    void* middle              = nullptr; // BF16 [tokens * 10][640]
+    void* shared_middle       = nullptr; // BF16 [tokens][640]
+    unsigned long long* fixed = nullptr; // [tokens][2560] and a completion counter
+    // The call's preparation: every slot's pairs, the tokens' inputs and the pairs' middles
+    // quantized once for all blocks.
+    void* records = nullptr;
+    void* inputs  = nullptr;
+    void* middles = nullptr;
+    cudaEvent_t join = nullptr; // the shared expert's side stream, when it ran on one
+};
+[[nodiscard]] bool moe_experts_gguf_decode_supported(const GgufMoeWeights& banks,
+                                                     std::int32_t tokens);
+[[nodiscard]] std::size_t moe_experts_gguf_decode_workspace_bytes(std::int32_t tokens);
+[[nodiscard]] GgufMoeDecode moe_experts_gguf_decode_begin(const Tensor& m, const Tensor& ids,
+                                                          const Tensor& shared,
+                                                          const GgufMoeWeights& banks,
+                                                          WorkspaceArena& workspace,
+                                                          cudaStream_t stream,
+                                                          const GgufMoeSide* side = nullptr);
+void moe_experts_gguf_decode_missing(const GgufMoeDecode& state, const Tensor& m,
+                                     const Tensor& ids, const GgufMoeWeights& banks,
+                                     cudaStream_t stream);
+void moe_experts_gguf_decode_finish(const GgufMoeDecode& state, const Tensor& ids,
+                                    const Tensor* missing_ids, const Tensor& weights,
+                                    const GgufMoeWeights& banks, const GgufMoeWeights* missing_banks,
+                                    const float* products, const std::int32_t* product_pairs,
+                                    const std::int32_t* product_count, Tensor& y,
+                                    cudaStream_t stream);
+
+/**
  * One native expert projection bank. `experts` is a caller-owned device array of prepared
  * Weight operands, all in `format`: BF16 or Q2/Q4/Q5/Q6/Q8 row-split weights. The operands
  * retain their actual code/high/scale planes and layout; no selected-weight repack is needed.

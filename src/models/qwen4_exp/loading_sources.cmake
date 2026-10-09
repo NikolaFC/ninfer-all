@@ -14,4 +14,5 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/expert_profile.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/hybrid_experts.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_stream.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/expert_misses.cu"
 )

@@ -298,6 +298,18 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric("ngram read per pass", pass.str());
         print_metric("ngram stalls", stall.str());
     }
+    const ninfer::ExpertResidencyStats& experts = stats.experts;
+    if (experts.routes != 0) {
+        std::ostringstream moved;
+        moved << std::fixed << std::setprecision(1) << double(experts.transferred_bytes) / 1048576.0
+              << " MiB, " << experts.admitted << " admitted";
+        print_metric("expert slots", std::to_string(experts.slots));
+        print_metric("expert hits", format_percent(experts.hits, experts.routes));
+        if (experts.cpu_routes != 0) {
+            print_metric("expert CPU routes", format_percent(experts.cpu_routes, experts.routes));
+        }
+        print_metric("expert transfers", moved.str());
+    }
 }
 
 } // namespace

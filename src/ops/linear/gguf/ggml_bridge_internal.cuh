@@ -95,6 +95,12 @@ struct MoeVecArgs {
 
 template <ggml_type type>
 void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused, cudaStream_t stream);
+template <ggml_type type>
+void moe_decode_up_launch(const MoeDecodeUpArgs& args, int chunk, cudaStream_t stream);
+template <ggml_type type>
+void moe_decode_down_launch(const MoeDecodeDownArgs& args, int chunk, cudaStream_t stream);
+template <ggml_type type>
+void moe_decode_prep_launch(const MoeDecodePrepArgs& args, cudaStream_t stream);
 
 // Byte offset of the scales inside a planar vector activation of `columns` x `k`.
 [[nodiscard]] constexpr std::size_t vec_scales_offset(int k, int columns) {

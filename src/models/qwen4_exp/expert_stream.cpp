@@ -374,4 +374,10 @@ void ExpertStream::prepare(std::size_t layer, std::span<const std::int32_t> ids)
 
 ExpertStreamStats ExpertStream::stats() const noexcept { return impl_->stats; }
 
+std::pair<std::uintptr_t, std::uintptr_t> ExpertStream::storage(std::size_t rank) const {
+    const auto& pool = impl_->pools.at(rank);
+    const auto begin = reinterpret_cast<std::uintptr_t>(pool.storage.p);
+    return {begin, begin + pool.storage.bytes};
+}
+
 } // namespace ninfer::models::qwen4_exp

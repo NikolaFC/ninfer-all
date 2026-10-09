@@ -11,6 +11,7 @@
 #include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_draft_prefetch.h"
+#include "models/qwen4_exp/expert_misses.h"
 #include "models/qwen4_exp/expert_stream.h"
 #include "models/qwen4_exp/ngram_table.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -456,6 +457,7 @@ struct RankState {
     cudaEvent_t staged = nullptr;
     cudaEvent_t done   = nullptr;
     cudaEvent_t routes = nullptr; // the last pass's routes reached the host
+    ops::GgufMoeSide side;        // the decode MoE's shared expert runs there concurrently
     // Activation planes (capacity: prefill_chunk tokens).
     float* stack            = nullptr;
     std::int32_t* ids       = nullptr;
@@ -569,6 +571,9 @@ struct Executor::Impl {
     std::unique_ptr<PinnedHostBuffer> mtp_staging;
     cudaEvent_t mtp_staged       = nullptr;
     std::uint32_t mtp_routes     = 0; // MTP route pairs recorded for the expert cache
+    // While a draft chain is captured: its replays count no routes for the expert cache (the
+    // catch-up passes after a commit still do).
+    bool capturing_draft = false;
     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
     PagedKVStorageLayout kv_layout;   // the planes of every sparse-attention layer's KV
     std::uint32_t pooled_slots   = 0; // indexer blocks per sequence and attention layer
@@ -583,9 +588,16 @@ struct Executor::Impl {
     const std::atomic<bool>* cancelled = nullptr;
     // Disk-resident experts: made resident before each layer's experts run.
     std::unique_ptr<ExpertStream> stream;
-    std::vector<DeviceBuffer> route_records;
+    // GGUF host or disk experts: a decode or verification call's missing experts, staged (or
+    // computed by the CPU) while its cached ones run.
+    std::unique_ptr<ExpertMisses> misses;
+    // Each expert layer's routes of the current pass, [layer][10 * prefill_chunk] in one block per
+    // rank (a stage's layers are consecutive), so one copy brings a rank's text layers home.
+    std::vector<DeviceBuffer> route_blocks; // by rank
+    std::vector<void*> route_records;       // by expert layer
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
+    std::uint64_t pending_chunks = 1; // chunks of the pass whose routes are pending
 
     // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
@@ -603,6 +615,27 @@ struct Executor::Impl {
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
     std::unique_ptr<PinnedHostBuffer> slot_entries;
+    // Wide host calls of at least kPrefetchTokens touch nearly every expert of a layer: every
+    // expert the cache lacks is copied into the pool on the transfer stream while the layers
+    // before run, without waiting for the layer's routes. Two pinned entry tables alternate.
+    static constexpr std::int32_t kPrefetchTokens = 256;
+    struct PoolPrefetch {
+        std::size_t layer = ~std::size_t{0};
+        cudaEvent_t ready = nullptr, free = nullptr;
+        std::array<std::unique_ptr<PinnedHostBuffer>, 2> entries;
+        int next = 0;
+    };
+    std::vector<PoolPrefetch> prefetches; // by rank
+
+    // Layer-major prompt spans (forward_span): the chunks' stacks, staged positions and n-gram
+    // rows while every chunk of a span passes a layer before any passes the next. span_tokens is 0
+    // when spans are off.
+    static constexpr std::uint32_t kSpanChunks = 8;
+    std::uint32_t span_tokens = 0;
+    DeviceBuffer span_stack, span_positions, span_rope, span_rows;
+    std::size_t span_row_bytes = 0; // n-gram rows of one token
+    // A span's chunk before its last runs a layer's experts: the pool keeps that layer's experts.
+    bool span_hold = false;
 
     // Vision (a model loaded with its tower), on rank 0 beside the token embedding: the encoder's
     // workspace, whose handoff region receives one item at a time, and the merged embeddings of
@@ -657,16 +690,32 @@ struct Executor::Impl {
         if (native_host && options.sequences != 1) {
             throw std::invalid_argument("native host experts require concurrency 1");
         }
-        if (!native_host && (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
-            options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.adaptive_cache ||
-            !options.hybrid_experts.routing_profile.empty() || !options.hybrid_experts.record_profile.empty())) {
-            throw std::invalid_argument("hybrid expert options require native host experts");
+        if (!native_host && options.hybrid_experts.adaptive_cache) {
+            throw std::invalid_argument("--expert-cache-adaptive requires native host experts");
+        }
+        if (!native_host && model.options().experts != ExpertResidency::Host &&
+            (!options.hybrid_experts.routing_profile.empty() ||
+             !options.hybrid_experts.record_profile.empty())) {
+            throw std::invalid_argument("expert routing profiles require host experts");
+        }
+        const auto residency = model.options().experts;
+        if (residency == ExpertResidency::Device &&
+            (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
+             options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.mapped_misses)) {
+            throw std::invalid_argument("expert DMA shares, CPU threads and miss paths require "
+                                        "host or disk experts");
+        }
+        if (options.hybrid_experts.mapped_misses &&
+            (residency != ExpertResidency::Host || native_host ||
+             options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share)) {
+            throw std::invalid_argument("mapped misses need GGUF host experts and all misses on the GPU");
         }
         plan_segments();
         allocate_ranks();
         allocate_vision();
         allocate_sequences();
         if (verify_width > 0) { allocate_speculation(); }
+        allocate_span();
         allocate_cache();
         for (const auto& rank : memory.ranks) {
             memory.state_bytes += rank.state_bytes;
@@ -705,6 +754,9 @@ struct Executor::Impl {
             if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
             if (rank.done != nullptr) { cudaEventDestroy(rank.done); }
             if (rank.routes != nullptr) { cudaEventDestroy(rank.routes); }
+            if (rank.side.fork != nullptr) { cudaEventDestroy(rank.side.fork); }
+            if (rank.side.join != nullptr) { cudaEventDestroy(rank.side.join); }
+            if (rank.side.stream != nullptr) { cudaStreamDestroy(rank.side.stream); }
         }
         if (mtp_staged != nullptr) {
             RankBinding bind(device, model.head_rank());
@@ -714,6 +766,11 @@ struct Executor::Impl {
             RankBinding bind(device, rows_rank);
             if (events.wanted != nullptr) { cudaEventDestroy(events.wanted); }
             if (events.ready != nullptr) { cudaEventDestroy(events.ready); }
+        }
+        for (std::size_t r = 0; r < prefetches.size(); ++r) {
+            RankBinding bind(device, r);
+            if (prefetches[r].ready != nullptr) { cudaEventDestroy(prefetches[r].ready); }
+            if (prefetches[r].free != nullptr) { cudaEventDestroy(prefetches[r].free); }
         }
     }
 
@@ -887,7 +944,10 @@ struct Executor::Impl {
                  projection_workspace(mtp->fc_embedding, t),
                  projection_workspace(mtp->fc_hidden,
                                       t * static_cast<std::int32_t>(config.hc_count)),
-                 projection_workspace(mtp->head, static_cast<std::int32_t>(max_logit_rows))});
+                 projection_workspace(mtp->head, static_cast<std::int32_t>(max_logit_rows)),
+                 // The MTP block's calls over cached experts only: their kept ids and weights.
+                 ops::moe_experts_gguf_workspace_bytes(t) +
+                     2 * ((std::size_t(config.num_experts_per_tok) * t * 4 + 255) / 256 * 256)});
         }
         for (const LayerPlan* layer : planned) {
             const LayerPlan& plan = *layer;
@@ -990,6 +1050,9 @@ struct Executor::Impl {
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.routes, cudaEventDisableTiming));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&rank.side.stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.side.fork, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.side.join, cudaEventDisableTiming));
             memory.ranks[r].workspace_bytes += total + rank.workspace->capacity();
             ranks.push_back(std::move(rank));
         }
@@ -1259,9 +1322,18 @@ struct Executor::Impl {
         const std::uint64_t pairs =
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
         const auto expert = expert_layers();
+        std::vector<std::size_t> on_rank(device.size(), 0);
+        for (const auto& [plan, moe] : expert) { ++on_rank[plan->rank]; }
+        route_blocks.resize(device.size());
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            if (on_rank[r] == 0) { continue; }
+            RankBinding bind(device, r);
+            route_blocks[r] = DeviceBuffer(on_rank[r] * pairs * sizeof(std::int32_t));
+        }
+        std::fill(on_rank.begin(), on_rank.end(), 0);
         for (const auto& [plan, moe] : expert) {
-            RankBinding bind(device, plan->rank);
-            route_records.emplace_back(pairs * sizeof(std::int32_t));
+            route_records.push_back(static_cast<std::byte*>(route_blocks[plan->rank].p) +
+                                    on_rank[plan->rank]++ * pairs * sizeof(std::int32_t));
         }
         route_host =
             std::make_unique<PinnedHostBuffer>(expert.size() * pairs * sizeof(std::int32_t));
@@ -1324,6 +1396,11 @@ struct Executor::Impl {
                            : std::min<std::uint64_t>(available,
                                                      options.expert_cache_bytes / device.size());
         }
+        // Disk experts keep their per-layer residency until staged experts can enter its slots.
+        const bool staged = residency == ExpertResidency::Host && !options.hybrid_experts.mapped_misses;
+        if (staged) {
+            for (auto& b : bytes) { b = b > kStagingBytes ? b - kStagingBytes : 0; }
+        }
         if (residency == ExpertResidency::Disk) {
             if (options.expert_cache_bytes == 0) {
                 throw std::invalid_argument("disk-resident experts need a device expert cache");
@@ -1361,6 +1438,66 @@ struct Executor::Impl {
         for (std::size_t r = 0; r < bytes.size(); ++r) {
             memory.ranks[r].expert_cache_bytes += bytes[r];
         }
+        if (!options.hybrid_experts.routing_profile.empty()) {
+            std::vector<std::size_t> widths;
+            for (const auto& [plan, moe] : expert) { widths.push_back(plan->moe.gate.pointers.size()); }
+            cache->seed(read_expert_profile(options.hybrid_experts.routing_profile,
+                                            model.info().artifact_id, widths));
+        }
+        if (staged) { allocate_misses(); }
+    }
+
+    // Device staging of the missing experts, taken from the expert cache's share of each device.
+    static constexpr std::uint64_t kStagingBytes = 128ULL << 20;
+
+    void allocate_misses() {
+        std::vector<MissLayer> out;
+        const auto expert = expert_layers();
+        for (std::size_t i = 0; i < expert.size(); ++i) {
+            const auto& [plan, moe] = expert[i];
+            MissLayer layer;
+            layer.rank    = plan->rank;
+            layer.experts = plan->moe.gate.pointers.size();
+            const ExpertTable* tables[3] = {&plan->moe.gate, &plan->moe.up, &plan->moe.down};
+            const std::span<const ExpertLocation> located[3] = {moe->located_gate, moe->located_up,
+                                                                moe->located_down};
+            for (int k = 0; k < 3; ++k) {
+                auto& p        = layer.projections[std::size_t(k)];
+                p.format       = tables[k]->format;
+                p.row_bytes    = tables[k]->row_bytes;
+                p.rows         = tables[k]->rows;
+                p.k            = std::int32_t(k == 2 ? config.moe_intermediate_size
+                                                     : config.hidden_size);
+                p.expert_bytes = std::int64_t(p.rows) * p.row_bytes;
+                if (stream) {
+                    p.located = located[k];
+                } else {
+                    p.host = tables[k]->pointers;
+                }
+            }
+            layer.gate_table = static_cast<const void* const*>(plan->moe.gate.table.p);
+            // The text layers' slots follow their misses; the MTP block's keep the cache's own
+            // policy.
+            if (cache && !stream && i < layers.size()) {
+                cache->hand_over(i);
+                layer.admit = true;
+            }
+            if (cache) {
+                layer.resident = cache->storage(i);
+            } else if (stream) {
+                layer.resident[0] = stream->storage(plan->rank);
+            }
+            out.push_back(std::move(layer));
+        }
+        MissOptions miss;
+        miss.token_capacity = kVectorTokens;
+        miss.cpu_share      = 1.0 - double(options.hybrid_experts.dma_share);
+        miss.cpu_threads    = options.hybrid_experts.cpu_threads;
+        miss.staging_bytes  = kStagingBytes;
+        misses              = std::make_unique<ExpertMisses>(
+            device, std::move(out),
+            stream ? model.files() : std::vector<std::filesystem::path>{}, miss, cache.get());
+        for (auto& rank : memory.ranks) { rank.workspace_bytes += kStagingBytes; }
     }
 
     // One slot per expert on every rank, sized for its layers' widest projections, when half the
@@ -1395,6 +1532,62 @@ struct Executor::Impl {
             memory.ranks[r].workspace_bytes += pool.storage.bytes + pool.tables.bytes;
         }
         slot_entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
+        prefetches.resize(device.size());
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            if (slot_pools[r].slots == 0) { continue; }
+            RankBinding bind(device, r);
+            auto& prefetch = prefetches[r];
+            CUDA_CHECK(cudaEventCreateWithFlags(&prefetch.ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&prefetch.free, cudaEventDisableTiming));
+            for (auto& entries : prefetch.entries) {
+                entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
+            }
+        }
+    }
+
+    // Copies every expert of text layer `index` that the cache lacks into its rank's pool, on the
+    // transfer stream once the pool's previous call is done with it, and points the pool's tables
+    // at the cache or the copies.
+    void prefetch_layer(std::size_t index) {
+        const LayerPlan& plan = layers[index];
+        SlotPool& pool        = slot_pools[plan.rank];
+        PoolPrefetch& state   = prefetches[plan.rank];
+        RankBinding bind(device, plan.rank);
+        const cudaStream_t t  = device.rank(plan.rank).transfer_stream;
+        CUDA_CHECK(cudaStreamWaitEvent(t, state.free, 0));
+        const MoePlan& m          = plan.moe;
+        const std::size_t experts = m.gate.pointers.size();
+        auto* entries = static_cast<const void**>(state.entries[std::size_t(state.next)]->data());
+        state.next ^= 1;
+        const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
+        for (std::size_t e = 0; e < experts; ++e) {
+            if (cache && cache->cached(index, 0, std::int32_t(e)) != nullptr) {
+                for (int k = 0; k < 3; ++k) {
+                    entries[k * experts + e] = cache->cached(index, k, std::int32_t(e));
+                }
+                continue;
+            }
+            auto* base = static_cast<std::byte*>(pool.storage.p) + e * pool.slot_bytes;
+            for (int k = 0; k < 3; ++k) {
+                const std::uint64_t bytes = std::uint64_t(tables[k]->rows) * tables[k]->row_bytes;
+                std::byte* target         = base + pool.offset[k];
+                CUDA_CHECK(cudaMemcpyAsync(target, tables[k]->pointers[e], std::size_t(bytes),
+                                           cudaMemcpyHostToDevice, t));
+                if (k == 2) {
+                    std::uint64_t& written = pool.down_written[e];
+                    if (written > bytes) {
+                        CUDA_CHECK(cudaMemsetAsync(
+                            target + bytes, 0, std::size_t(std::min(written - bytes, kSlotTail)), t));
+                    }
+                    written = std::max(written, bytes);
+                }
+                entries[k * experts + e] = target;
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
+                                   cudaMemcpyHostToDevice, t));
+        CUDA_CHECK(cudaEventRecord(state.ready, t));
+        state.layer = index;
     }
 
     // Feeds the last pass's routes to the expert cache and lets it swap experts, before the next
@@ -1422,9 +1615,12 @@ struct Executor::Impl {
                                mtp_routes);
             }
             // A prompt chunk moves the working set; a decode step only nudges it.
-            cache->rebalance(pending_routes > 1 ? (2048ULL << 20) : (48ULL << 20));
+            // A span of several chunks earns each chunk's budget.
+            cache->rebalance(pending_routes > 1 ? (2048ULL << 20) * pending_chunks : (48ULL << 20),
+                             pending_routes > kVectorTokens);
         }
         pending_routes = 0;
+        pending_chunks = 1;
         mtp_routes     = 0;
     }
 
@@ -1434,11 +1630,15 @@ struct Executor::Impl {
         const std::uint64_t pairs =
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
         auto* host = static_cast<std::int32_t*>(route_host->data());
-        for (std::size_t i = 0; i < layers.size(); ++i) {
+        for (std::size_t i = 0; i < layers.size();) {
+            std::size_t end = i;
+            while (end < layers.size() && layers[end].rank == layers[i].rank) { ++end; }
             RankBinding bind(device, layers[i].rank);
-            CUDA_CHECK(cudaMemcpyAsync(host + i * pairs, route_records[i].p,
-                                       std::size_t(config.num_experts_per_tok) * tokens * 4,
-                                       cudaMemcpyDeviceToHost, ranks[layers[i].rank].stream));
+            CUDA_CHECK(cudaMemcpy2DAsync(host + i * pairs, pairs * 4, route_records[i], pairs * 4,
+                                         std::size_t(config.num_experts_per_tok) * tokens * 4,
+                                         end - i, cudaMemcpyDeviceToHost,
+                                         ranks[layers[i].rank].stream));
+            i = end;
         }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
@@ -1951,6 +2151,36 @@ struct Executor::Impl {
         SlotPool& pool = slot_pools[rank.rank];
         if (pool.slots == 0) { return false; }
         const cudaStream_t s = rank.stream;
+        if (t >= kPrefetchTokens && pool.slots >= plan.moe.gate.pointers.size()) {
+            PoolPrefetch& state = prefetches[rank.rank];
+            if (state.layer != index) { prefetch_layer(index); }
+            CUDA_CHECK(cudaStreamWaitEvent(s, state.ready, 0));
+            ops::GgufMoeWeights banks = plan.moe.banks();
+            const auto* table_p       = static_cast<const void* const*>(pool.tables.p);
+            const std::size_t experts = plan.moe.gate.pointers.size();
+            banks.gate.experts        = table_p;
+            banks.up.experts          = table_p + experts;
+            banks.down.experts        = table_p + 2 * experts;
+            banks.device_resident     = true;
+            const auto h              = static_cast<std::int32_t>(config.hidden_size);
+            const Tensor mixed(rank.mixed, DType::BF16, {h, t});
+            Tensor y(rank.y, DType::FP32, {h, t});
+            {
+                auto scope = rank.workspace->scope();
+                ops::moe_experts_gguf(mixed, ids, weights, shared, banks, *rank.workspace, y, s);
+            }
+            CUDA_CHECK(cudaEventRecord(state.free, s));
+            // A span's later chunks run this layer's experts again from the pool; otherwise the
+            // next text layer on this device starts its copies now.
+            if (span_hold) { return true; }
+            if (index + 1 < layers.size() && layers[index + 1].rank == rank.rank &&
+                !layers[index + 1].moe.native) {
+                prefetch_layer(index + 1);
+            } else {
+                state.layer = ~std::size_t{0};
+            }
+            return true;
+        }
         const auto top       = static_cast<std::int32_t>(config.num_experts_per_tok);
         auto* routes         = static_cast<std::int32_t*>(route_host->data()) +
                                index * std::size_t(top) * options.prefill_chunk;
@@ -2020,7 +2250,7 @@ struct Executor::Impl {
         const auto h         = static_cast<std::int32_t>(config.hidden_size);
         const auto top       = static_cast<std::int32_t>(config.num_experts_per_tok);
         const Tensor mixed(rank.mixed, DType::BF16, {h, t});
-        Tensor ids(route_records[index].p, DType::I32, {top, t});
+        Tensor ids(route_records[index], DType::I32, {top, t});
         Tensor weights(rank.route_weights, DType::FP32, {top, t});
         Tensor shared(rank.route_shared, DType::FP32, {t});
         {
@@ -2036,6 +2266,58 @@ struct Executor::Impl {
             }
             auto scope = ws.scope();
             ops::moe_experts_native(mixed, ids, weights, shared, m.native->banks(), nullptr, ws, y, s);
+            return;
+        }
+        if (misses && index == layers.size()) {
+            // The MTP block only steers drafts, which verification checks: its missing experts
+            // are dropped rather than fetched.
+            Tensor y(rank.y, DType::FP32, {h, t});
+            auto scope = ws.scope();
+            Tensor kept_ids     = ws.alloc(DType::I32, {top, t});
+            Tensor kept_weights = ws.alloc(DType::FP32, {top, t});
+            misses->drop_missing(index, ids, weights, kept_ids, kept_weights, s);
+            if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
+                const auto state = ops::moe_experts_gguf_decode_begin(mixed, kept_ids, shared,
+                                                                      m.banks(), ws, s, &rank.side);
+                ops::moe_experts_gguf_decode_finish(state, kept_ids, nullptr, kept_weights,
+                                                    m.banks(), nullptr, nullptr, nullptr, nullptr,
+                                                    y, s);
+                return;
+            }
+            const auto stage = ops::moe_experts_gguf_begin(mixed, ws, s);
+            ops::moe_experts_gguf_add(stage, mixed, kept_ids, kept_weights, &shared, m.banks(), ws,
+                                      s);
+            ops::moe_experts_gguf_finish(stage, y, s);
+            return;
+        }
+        if (misses && t <= kVectorTokens) {
+            // The cached pairs run at once; the missing experts arrive (or the CPU computes them)
+            // meanwhile, and run in a second stage.
+            Tensor y(rank.y, DType::FP32, {h, t});
+            auto scope      = ws.scope();
+            const auto call = misses->begin(index, ids, mixed, t, m.banks(), s);
+            if (ops::moe_experts_gguf_decode_supported(m.banks(), t)) {
+                const auto state = ops::moe_experts_gguf_decode_begin(
+                    mixed, call.cached_ids, shared, m.banks(), ws, s, &rank.side);
+                misses->await(index, s);
+                ops::moe_experts_gguf_decode_missing(state, mixed, call.missing_ids,
+                                                     call.missing_banks, s);
+                ops::moe_experts_gguf_decode_finish(state, call.cached_ids, &call.missing_ids,
+                                                    weights, m.banks(), &call.missing_banks,
+                                                    call.products, call.pairs, call.count, y, s);
+                return;
+            }
+            const auto stage = ops::moe_experts_gguf_begin(mixed, ws, s);
+            ops::moe_experts_gguf_add(stage, mixed, call.cached_ids, weights, &shared, m.banks(),
+                                      ws, s);
+            misses->await(index, s);
+            ops::moe_experts_gguf_add(stage, mixed, call.missing_ids, weights, nullptr,
+                                      call.missing_banks, ws, s);
+            if (call.max_products > 0) {
+                ops::moe_experts_gguf_add_products(stage, call.products, call.pairs, call.count,
+                                                   call.max_products, weights, s);
+            }
+            ops::moe_experts_gguf_finish(stage, y, s);
             return;
         }
         // The slot pools are sized for the text layers' experts; the MTP block's wide calls stay
@@ -2080,18 +2362,31 @@ struct Executor::Impl {
             }
             ops::hyper_connection_expand(mixed, stack, rank.stream);
         }
+        // A layer's MoE output is written into the stack by the next layer's read, which takes
+        // the same rounding, unless the PLE comes between.
+        Tensor inject(rank.inject, DType::FP32, {hc, t});
+        const Tensor moe_out(rank.y, DType::FP32, {h, t});
+        bool pending = false;
         for (std::size_t i = segment.begin; i < segment.end; ++i) {
             const LayerPlan& plan = layers[i];
             if (plan.ple) {
+                if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
+                pending = false;
                 for (const Part& part : parts) {
                     run_ple(plan, part.sequence->layers[i], rank, part);
                 }
             }
-            Tensor inject(rank.inject, DType::FP32, {hc, t});
             {
                 auto scope = rank.workspace->scope();
-                ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
-                                           *rank.workspace, mixed, &inject, rank.stream);
+                if (pending) {
+                    ops::hyper_connection_write_read(stack, moe_out, inject, plan.attn_hc.weights(),
+                                                     config.rms_norm_eps, *rank.workspace, mixed,
+                                                     &inject, rank.stream);
+                } else {
+                    ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
+                                               *rank.workspace, mixed, &inject, rank.stream);
+                }
+                pending = false;
             }
             for (const Part& part : parts) {
                 LayerState& state = part.sequence->layers[i];
@@ -2108,9 +2403,9 @@ struct Executor::Impl {
                     config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
             }
             run_moe(plan, rank, t, i);
-            ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
-                                        rank.stream);
+            pending = true;
         }
+        if (pending) { ops::hyper_connection_write(stack, moe_out, inject, rank.stream); }
         if (!segment.head) { return; }
         const auto n = static_cast<std::int32_t>(logit_rows);
         const Tensor last(rank.stack + std::size_t(hc) * h * (t - n), DType::FP32, {h, hc, n});
@@ -2170,7 +2465,10 @@ struct Executor::Impl {
                 throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
             }
         }
+        fence_misses();
         settle_routes();
+        // A copy queued for an earlier pass may predate the cache's last swaps.
+        for (auto& prefetch : prefetches) { prefetch.layer = ~std::size_t{0}; }
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_inputs(parts, tokens);
         // Disk-resident experts need the host between a layer's routing and its experts, so their
@@ -2178,9 +2476,12 @@ struct Executor::Impl {
         // sequence replays its graphs while its experts take the vector products. Native host
         // experts coordinate with their supervisor through captured handshakes.
         SequenceState& first = *parts.front().sequence;
-        const bool graph     = options.cuda_graphs && t == 1 && !stream && !verifying;
-        const bool verify_graph =
-            options.cuda_graphs && verifying && parts.size() == 1 && !stream && t <= kVectorTokens;
+        // Staged misses keep disk experts' decode and verification free of host synchronization.
+        const bool host_free = !stream || misses;
+        const bool graph     = options.cuda_graphs && t == 1 && host_free && !verifying;
+        const bool verify_graph = options.cuda_graphs && verifying && parts.size() == 1 &&
+                                  host_free && t <= kVectorTokens;
+        if (misses) { misses->keep_alive(); }
         if (graph && first.decode.empty() && first.decode_steps++ > 0) { capture_decode(first); }
         auto* verification = verify_graph ? &first.verify.at(std::size_t(t)) : nullptr;
         if (verification && verification->segments.empty() && verification->runs++ > 0) {
@@ -2209,9 +2510,226 @@ struct Executor::Impl {
             }
         }
         record_routes(static_cast<std::uint32_t>(t));
+        if (misses) {
+            for (std::size_t r = 0; r < ranks.size(); ++r) {
+                RankBinding bind(device, r);
+                misses->publish(ranks[r].stream, r);
+            }
+        }
+        // While a staged layer waits on the device for its missing experts, no other launch may
+        // load a kernel lazily: loading can wait for the device to go idle, the waiting kernel for
+        // the misses' service, and the service's own calls for the loader. The caller's next
+        // kernels therefore follow a pass that may have waited.
+        if (misses && t <= kVectorTokens) { synchronize_ranks(); }
+    }
+
+    // Slots taken behind the last pass's calls are filled before anything later on the streams,
+    // this pass and the cache's rebalance, touches them.
+    void fence_misses() {
+        if (!misses) { return; }
+        for (std::size_t r = 0; r < ranks.size(); ++r) {
+            RankBinding bind(device, r);
+            misses->fence(ranks[r].stream, r);
+        }
+    }
+
+    void synchronize_ranks() {
+        for (auto& rank : ranks) {
+            RankBinding bind(device, rank.rank);
+            CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        }
+    }
+
+    // Spans need one device and GGUF host experts, whose wide calls copy every uncached expert of
+    // a layer into the pool: per span instead of per chunk.
+    void allocate_span() {
+        const bool native = std::any_of(layers.begin(), layers.end(),
+                                        [](const LayerPlan& plan) { return plan.moe.native.has_value(); });
+        // One device: its segments split only where the PLE layer's rows arrive.
+        const bool one_rank = std::all_of(segments.begin(), segments.end(),
+                                          [](const Segment& segment) { return segment.rank == 0; });
+        if (model.options().experts != ExpertResidency::Host || native || !one_rank) { return; }
+        const std::uint32_t tokens =
+            std::min<std::uint32_t>(options.max_context, kSpanChunks * options.prefill_chunk);
+        if (tokens <= options.prefill_chunk) { return; }
+        span_tokens       = tokens;
+        const auto width  = std::size_t(config.hc_count) * config.hidden_size;
+        RankBinding bind(device, 0);
+        span_stack     = DeviceBuffer(std::size_t(tokens) * width * 4);
+        span_positions = DeviceBuffer(std::size_t(tokens) * 4);
+        span_rope      = DeviceBuffer(std::size_t(tokens) * 4);
+        std::uint64_t bytes = span_stack.bytes + span_positions.bytes + span_rope.bytes;
+        if (table) {
+            span_row_bytes = std::size_t(config.ngram_heads()) *
+                             ops::ngram_row_bytes(options.ngram->format);
+            span_rows      = DeviceBuffer(std::size_t(tokens) * span_row_bytes);
+            bytes += span_rows.bytes;
+        }
+        memory.ranks[0].workspace_bytes += bytes;
+    }
+
+    // A prompt span of several chunks, layer by layer: every chunk passes a layer before any passes
+    // the next, so a wide call's pool copy of the layer's uncached experts serves every chunk. The
+    // arithmetic of each chunk is that of forward(); the logits are the last chunk's.
+    void forward_span(std::uint32_t s, std::span<const std::int32_t> tokens,
+                      std::uint32_t logit_rows) {
+        const std::size_t n = tokens.size();
+        const std::size_t c = options.prefill_chunk;
+        if (span_tokens == 0 || n > span_tokens) {
+            throw std::invalid_argument("qwen4_exp forward: tokens exceed the prompt span");
+        }
+        SequenceState& sequence = sequences.at(s);
+        const std::uint32_t start = sequence.position;
+        if (start + n > options.max_context) {
+            throw std::invalid_argument("qwen4_exp forward: the sequence exceeds max_context");
+        }
+        const std::size_t prompt = sequence.media_rope.size() / 3;
+        if (prompt != 0 && start < prompt) {
+            throw std::invalid_argument("qwen4_exp forward: a media prompt prefills chunk by chunk");
+        }
+        const std::size_t chunks = (n + c - 1) / c;
+        const auto last_count    = static_cast<std::uint32_t>(n - (chunks - 1) * c);
+        check_tokens(tokens.subspan((chunks - 1) * c), logit_rows);
+        for (std::size_t k = 0; k + 1 < chunks; ++k) { check_tokens(tokens.subspan(k * c, c), 1); }
+        RankBinding bind(device, 0);
+        RankState& rank      = ranks[0];
+        const cudaStream_t st = rank.stream;
+        const auto h         = static_cast<std::int32_t>(config.hidden_size);
+        const auto hc        = static_cast<std::int32_t>(config.hc_count);
+        const std::size_t width = std::size_t(hc) * std::size_t(h);
+        const auto chunk_stack  = [&](std::size_t k) {
+            return static_cast<float*>(span_stack.p) + k * c * width;
+        };
+        const auto count_of = [&](std::size_t k) {
+            return static_cast<std::int32_t>(std::min(c, n - k * c));
+        };
+        fence_misses();
+        settle_routes();
+        for (auto& prefetch : prefetches) { prefetch.layer = ~std::size_t{0}; }
+        float* const own_stack = rank.stack;
+        // The chunks' inputs, staged one after another as forward() stages them, kept in the
+        // span planes; their embeddings start their stacks.
+        for (std::size_t k = 0; k < chunks; ++k) {
+            const std::int32_t t = count_of(k);
+            const Part part{.sequence = &sequence, .column = 0, .count = t};
+            stage_inputs(std::span(&part, 1), tokens.subspan(k * c, std::size_t(t)));
+            Tensor mixed(rank.mixed, DType::BF16, {h, t});
+            ops::embedding(Tensor(rank.ids, DType::I32, {t}), embedding_table, mixed, st);
+            Tensor stack(chunk_stack(k), DType::FP32, {h, hc, t});
+            ops::hyper_connection_expand(mixed, stack, st);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_positions.p) + k * c,
+                                       rank.positions, std::size_t(t) * 4,
+                                       cudaMemcpyDeviceToDevice, st));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::int32_t*>(span_rope.p) + k * c, rank.rope,
+                                       std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+            if (table && std::any_of(segments.begin(), segments.end(),
+                                     [](const Segment& segment) { return segment.rows; })) {
+                stage_rows(rank);
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(span_rows.p) +
+                                               k * c * span_row_bytes,
+                                           rank.rows, std::size_t(t) * span_row_bytes,
+                                           cudaMemcpyDeviceToDevice, st));
+            }
+            sequence.position += std::uint32_t(t);
+        }
+        sequence.position = start;
+        try {
+            for (std::size_t i = 0; i < layers.size(); ++i) {
+                const LayerPlan& plan = layers[i];
+                LayerState& state     = sequence.layers[i];
+                for (std::size_t k = 0; k < chunks; ++k) {
+                    const std::int32_t t = count_of(k);
+                    const Part part{.sequence = &sequence, .column = 0, .count = t};
+                    CUDA_CHECK(cudaMemcpyAsync(rank.positions,
+                                               static_cast<std::int32_t*>(span_positions.p) + k * c,
+                                               std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+                    CUDA_CHECK(cudaMemcpyAsync(rank.rope,
+                                               static_cast<std::int32_t*>(span_rope.p) + k * c,
+                                               std::size_t(t) * 4, cudaMemcpyDeviceToDevice, st));
+                    if (plan.ple) {
+                        CUDA_CHECK(cudaMemcpyAsync(rank.rows,
+                                                   static_cast<std::byte*>(span_rows.p) +
+                                                       k * c * span_row_bytes,
+                                                   std::size_t(t) * span_row_bytes,
+                                                   cudaMemcpyDeviceToDevice, st));
+                    }
+                    rank.stack = chunk_stack(k);
+                    span_hold  = k + 1 < chunks;
+                    Tensor stack(rank.stack, DType::FP32, {h, hc, t});
+                    Tensor mixed(rank.mixed, DType::BF16, {h, t});
+                    Tensor inject(rank.inject, DType::FP32, {hc, t});
+                    if (plan.ple) { run_ple(plan, state, rank, part); }
+                    {
+                        auto scope = rank.workspace->scope();
+                        ops::hyper_connection_read(stack, plan.attn_hc.weights(),
+                                                   config.rms_norm_eps, *rank.workspace, mixed,
+                                                   &inject, st);
+                    }
+                    if (plan.gdn) {
+                        run_gdn(plan, i, state, rank, part);
+                    } else {
+                        run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
+                    }
+                    {
+                        auto scope = rank.workspace->scope();
+                        ops::hyper_connection_write_read(
+                            stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
+                            plan.mlp_hc.weights(), config.rms_norm_eps, *rank.workspace, mixed,
+                            &inject, st);
+                    }
+                    run_moe(plan, rank, t, i);
+                    ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
+                                                st);
+                }
+            }
+            span_hold = false;
+            // The head reads the last chunk's last rows.
+            rank.stack       = chunk_stack(chunks - 1);
+            const auto rows  = static_cast<std::int32_t>(logit_rows);
+            const Tensor last(rank.stack + width * std::size_t(std::int32_t(last_count) - rows),
+                              DType::FP32, {h, hc, rows});
+            Tensor head_mixed(rank.mixed, DType::BF16, {h, rows});
+            {
+                auto scope = rank.workspace->scope();
+                ops::hyper_connection_read(last, final_mixer.weights(), config.rms_norm_eps,
+                                           *rank.workspace, head_mixed, nullptr, st);
+            }
+            Tensor logits(rank.logits, DType::BF16,
+                          {static_cast<std::int32_t>(config.vocab_size), rows});
+            project(head, head_mixed, logits, *rank.workspace, st);
+            sequence.position = start + std::uint32_t(n);
+            record_routes(last_count);
+            // Up to four chunks' admission budget: more delays the first decode step.
+            pending_chunks = std::min<std::size_t>(chunks, 4);
+            // The MTP block catches up chunk by chunk over each chunk's own final stacks.
+            if (mtp) {
+                for (std::size_t k = 0; k < chunks; ++k) {
+                    rank.stack = chunk_stack(k);
+                    const auto t = count_of(k);
+                    const Committed committed{&sequence, 0, t, start + std::uint32_t(k * c),
+                                              tokens.subspan(k * c, std::size_t(t))};
+                    mtp_catch_up(std::span(&committed, 1));
+                }
+                // The next pass's MTP cells start from the last chunk's stack, which it copied.
+            }
+        } catch (...) {
+            rank.stack = own_stack;
+            span_hold  = false;
+            throw;
+        }
+        rank.stack = own_stack;
+    }
+
+    // Tokens one prompt call may take: a span with spans on, else a chunk.
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept {
+        return span_tokens != 0 ? span_tokens : options.prefill_chunk;
     }
 
     void forward(std::uint32_t s, std::span<const std::int32_t> tokens, std::uint32_t logit_rows) {
+        if (tokens.size() > options.prefill_chunk) {
+            forward_span(s, tokens, logit_rows);
+            return;
+        }
         check_tokens(tokens, logit_rows);
         SequenceState& sequence      = sequences.at(s);
         const std::uint32_t position = sequence.position;
@@ -2288,6 +2806,28 @@ struct Executor::Impl {
             CUDA_CHECK(cudaStreamSynchronize(rank.stream));
         }
         warming = false;
+    }
+
+    void grow_expert_cache(std::uint64_t keep) {
+        if (!cache) { return; }
+        std::vector<std::uint64_t> bytes(device.size(), 0);
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::size_t free_bytes = 0, total = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+            bytes[r] = free_bytes > keep ? free_bytes - keep : 0;
+        }
+        const auto added = cache->grow(bytes);
+        for (std::size_t r = 0; r < added.size(); ++r) {
+            memory.ranks[r].expert_cache_bytes += added[r];
+            memory.expert_cache_bytes += added[r];
+        }
+        if (misses) {
+            for (std::size_t i = 0; i < expert_layers().size(); ++i) {
+                misses->set_resident(i, cache->storage(i));
+            }
+        }
     }
 
     // ---- MTP speculative decoding ------------------------------------------------------------
@@ -2429,13 +2969,16 @@ struct Executor::Impl {
     // The MTP layer's routes for the expert cache, gathered over the passes between two target
     // passes (beyond a chunk of them the rest go uncounted).
     void record_mtp_routes(std::int32_t n) {
-        if (!cache || warming || mtp_routes + std::uint32_t(n) > options.prefill_chunk) { return; }
+        if (!cache || warming || capturing_draft ||
+            mtp_routes + std::uint32_t(n) > options.prefill_chunk) {
+            return;
+        }
         RankState& rank           = ranks[model.head_rank()];
         const std::uint64_t top   = config.num_experts_per_tok;
         const std::uint64_t pairs = top * options.prefill_chunk;
         auto* host = static_cast<std::int32_t*>(route_host->data()) + layers.size() * pairs +
                      top * mtp_routes;
-        CUDA_CHECK(cudaMemcpyAsync(host, route_records[layers.size()].p, std::size_t(top) * n * 4,
+        CUDA_CHECK(cudaMemcpyAsync(host, route_records[layers.size()], std::size_t(top) * n * 4,
                                    cudaMemcpyDeviceToHost, rank.stream));
         CUDA_CHECK(cudaEventRecord(rank.routes, rank.stream));
         mtp_routes += std::uint32_t(n);
@@ -2515,6 +3058,7 @@ struct Executor::Impl {
         if (n == 0) { return; }
         if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(ids, 0, positions, 0);
+        if (misses) { misses->keep_alive(); }
         mtp_pass(parts, n, static_cast<const std::int32_t*>(mtp_ids.p),
                  static_cast<const std::int32_t*>(mtp_positions.p), false);
         if (hybrid) { hybrid->finish(); }
@@ -2591,12 +3135,21 @@ struct Executor::Impl {
             if (draft_prefetch) { draft_prefetch->join(rank.stream); }
         };
         // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
-        // captured exchange as text decode; the older GGUF host cache still follows eagerly.
+        // captured exchange as text decode; GGUF host experts replay too, without counting the
+        // draft steps' routes.
         SequenceState& only = *drafting.front();
-        const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream && !cache;
+        const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream;
+        if (misses) { misses->keep_alive(); }
         if (graph && !only.draft.ready() && only.draft_runs++ > 0) {
             DecodeGraphDefinition definition;
-            definition.capture(rank.stream, chain);
+            capturing_draft = true;
+            try {
+                definition.capture(rank.stream, chain);
+            } catch (...) {
+                capturing_draft = false;
+                throw;
+            }
+            capturing_draft = false;
             only.draft.instantiate(definition);
         }
         if (graph && only.draft.ready()) {
@@ -2969,6 +3522,10 @@ std::uint64_t Executor::ngram_resident_bytes() const noexcept {
 void Executor::reset(std::uint32_t sequence) { impl_->reset(sequence); }
 
 void Executor::warm_up() { impl_->warm_up(); }
+std::uint32_t Executor::prompt_step() const noexcept { return impl_->prompt_step(); }
+void Executor::grow_expert_cache(std::uint64_t keep_free_bytes) {
+    impl_->grow_expert_cache(keep_free_bytes);
+}
 
 std::uint32_t Executor::position(std::uint32_t sequence) const {
     return impl_->sequences.at(sequence).position;
@@ -3057,7 +3614,13 @@ ExpertCacheStats Executor::expert_cache_stats() const noexcept {
                                 .copied_bytes = stream.read_bytes,
                                 .slots        = stream.slots};
     }
-    return impl_->cache ? impl_->cache->stats() : ExpertCacheStats{};
+    ExpertCacheStats out = impl_->cache ? impl_->cache->stats() : ExpertCacheStats{};
+    if (impl_->misses) {
+        const auto staged = impl_->misses->stats();
+        out.cpu_routes += staged.cpu_pairs;
+        out.copied_bytes += staged.staged_bytes;
+    }
+    return out;
 }
 
 cudaStream_t Executor::head_stream() const noexcept {
@@ -3065,14 +3628,22 @@ cudaStream_t Executor::head_stream() const noexcept {
 }
 
 std::string Executor::expert_execution_profile() const {
-    return impl_->hybrid ? impl_->hybrid->execution_profile() : "gpu";
+    if (impl_->hybrid) { return impl_->hybrid->execution_profile(); }
+    // A CPU share computes some routed pairs in other arithmetic.
+    if (impl_->misses && impl_->misses->cpu_enabled()) {
+        return "gguf-cpu-" + std::to_string(impl_->options.hybrid_experts.dma_share);
+    }
+    return "gpu";
 }
 
 bool Executor::hybrid_experts() const noexcept { return impl_->hybrid != nullptr; }
 void Executor::save_expert_profile() const {
     const auto& path = impl_->options.hybrid_experts.record_profile;
-    if (impl_->hybrid && !path.empty()) {
+    if (path.empty()) { return; }
+    if (impl_->hybrid) {
         write_expert_profile(path, impl_->model.info().artifact_id, impl_->hybrid->route_counts());
+    } else if (impl_->cache) {
+        write_expert_profile(path, impl_->model.info().artifact_id, impl_->cache->totals());
     }
 }
 void Executor::bind_cancellation(const std::atomic<bool>* cancelled) noexcept {

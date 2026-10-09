@@ -136,11 +136,19 @@ public:
     // verification's width, a full prefill chunk (16 tokens with host or disk experts, which a
     // chunk would copy or read whole), a decode step and, with drafts, a draft and a commit.
     void warm_up();
+    // After warm_up: gives the host expert cache what each device still has free beyond
+    // `keep_free_bytes`, as more slots. No effect without a host expert cache.
+    void grow_expert_cache(std::uint64_t keep_free_bytes);
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
 
-    // Runs `tokens` (at most prefill_chunk) at the sequence's next positions and leaves the logits
-    // of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head device.
-    // Work is queued on the device streams; logits() is ready on head_stream().
+    // Prompt tokens one forward() may take: prefill_chunk, or with layer-major spans (one stage,
+    // GGUF host experts) several chunks, which forward() runs layer by layer so that each layer's
+    // uncached experts cross the bus once for all of them.
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept;
+    // Runs `tokens` (at most prompt_step(); beyond prefill_chunk not a media prompt's) at the
+    // sequence's next positions and leaves the logits of the last `logit_rows` of them in
+    // logits(), BF16 [vocab, logit_rows] on the head device. Work is queued on the device
+    // streams; logits() is ready on head_stream().
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows);
     // Hints the next known tokens' table rows from a copy of the sequence's hash context. Does
