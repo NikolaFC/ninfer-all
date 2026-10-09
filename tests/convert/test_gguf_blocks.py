@@ -89,3 +89,30 @@ def test_output_projection_columns_read_the_grouped_value_heads():
     for tiled_head in (0, 1, 15, 16, 31, 47):
         key_head, repeat = tiled_head % 16, tiled_head // 16
         assert columns[tiled_head * 128 + 5] == (key_head * 3 + repeat) * 128 + 5
+
+
+def test_q8_0_gdn_controls_restore_grouped_bf16_values(tmp_path):
+    # Saluki-style exports store ssm_alpha/ssm_beta as Q8_0 blocks instead of BF16 words, so the
+    # read must dequantise them and still restore the exporter's grouped value-head order.
+    pytest.importorskip("gguf")
+    heads, columns = gguf_blocks.GDN_VALUE_HEADS, 64
+    generator = np.random.default_rng(5)
+    blocks = generator.integers(0, 256, size=(heads, columns // 32, 34), dtype=np.uint8)
+    scales = generator.uniform(0.001, 0.002, size=(heads, columns // 32)).astype(np.float16)
+    blocks[:, :, :2] = scales.view(np.uint8).reshape(heads, columns // 32, 2)
+    path = tmp_path / "saluki.gguf"
+    write_gguf(
+        path, {}, [("blk.0.ssm_alpha.weight", (heads, columns), TYPE_Q8_0, blocks.tobytes())]
+    )
+    with GGUFFile(path) as gguf:
+        source = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_alpha.weight")
+        values = source.rows(0, heads)
+    codes = blocks[:, :, 2:].copy().view(np.int8).astype(np.float32)
+    stored_scales = blocks[:, :, :2].copy().view(np.float16).astype(np.float32)
+    tiled = (codes * stored_scales).reshape(heads, columns)
+    # Grouped head h = k * 3 + r sits at the exporter's tiled position r * 16 + k.
+    order = np.empty(heads, dtype=np.int64)
+    for tiled_position in range(heads):
+        order[(tiled_position % 16) * 3 + tiled_position // 16] = tiled_position
+    expected = torch.from_numpy(tiled[order]).to(torch.bfloat16)
+    assert torch.equal(values, expected)

@@ -157,6 +157,15 @@ def validate(gguf: GGUFFile) -> None:
     for name, (shape, kind) in expected.items():
         info = gguf.tensors[name]
         stored = info.type_id in GGUF_FORMATS_BY_TYPE
+        if (
+            name.endswith(("ssm_alpha.weight", "ssm_beta.weight"))
+            and info.type_name == "Q8_0"
+        ):
+            # Saluki-style exports keep the small GDN controls in Q8_0 blocks instead of
+            # BF16. Accept as a third storage form; they are dequantised to BF16 on read.
+            if info.shape != shape:
+                raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
+            continue
         if info.shape != shape or (kind == "blocks") != stored or (
             kind != "blocks" and info.type_name != kind
         ):
@@ -228,6 +237,25 @@ def block_source(
 
     return LogicalSource(
         shape, f"{tensor}[{format}]{list(shape)}", _flat(values, shape[1]), encoded
+    )
+
+
+def gdn_control_source(gguf: GGUFFile, tensor: str) -> LogicalSource:
+    """One GDN A/B control as its BF16 operand, in the grouped value-head order.
+
+    The export may store the control as BF16 words (the ISTA/Swift convention) or as Q8_0
+    blocks (Saluki-style exports); both arrive at the same operand form.
+    """
+
+    if gguf.info(tensor).type_name == "Q8_0":
+        values = untile(_dequantize(gguf, tensor, 0, GDN_VALUE_HEADS).numpy(), 1)
+        return array_source(
+            torch.from_numpy(np.ascontiguousarray(values)).to(torch.bfloat16), tensor
+        )
+    words = untile(gguf.read_bf16_words(tensor), 1)
+    return array_source(
+        torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(torch.bfloat16),
+        tensor,
     )
 
 
@@ -387,13 +415,7 @@ def text_sources(
             gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
-            words = untile(gguf.read_bf16_words(g + tensor), 1)
-            direct[n + role] = array_source(
-                torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(
-                    torch.bfloat16
-                ),
-                g + tensor,
-            )
+            direct[n + role] = gdn_control_source(gguf, g + tensor)
         ssm_a = untile(gguf.read_direct(g + "ssm_a"), 1).astype(np.float64)
         if not np.all(ssm_a < 0):
             raise ValueError(f"{g}ssm_a must be strictly negative (-exp(A_log))")
@@ -570,6 +592,7 @@ __all__ = [
     "block_format",
     "block_source",
     "expected_tensors",
+    "gdn_control_source",
     "has_mtp",
     "qwen3_8_27b_gguf",
     "q2_native_source",
